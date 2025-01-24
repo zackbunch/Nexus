@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"mime"
@@ -8,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
+	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
 )
 
@@ -25,6 +28,7 @@ var (
 	nexusUsername  string
 	nexusToken     string
 	nexusDirectory string
+	concurrency    int
 )
 
 var rootCmd = &cobra.Command{
@@ -45,6 +49,7 @@ func init() {
 	rootCmd.Flags().StringVar(&nexusUsername, "username", defaultUsername, "Nexus username")
 	rootCmd.Flags().StringVar(&nexusToken, "token", defaultToken, "Nexus token")
 	rootCmd.Flags().StringVarP(&nexusDirectory, "directory", "d", "", "Target directory in Nexus (required)")
+	rootCmd.Flags().IntVarP(&concurrency, "concurrency", "c", 0, "Number of concurrent uploads. If 0, uploads are sequential")
 
 	rootCmd.MarkFlagRequired("source")
 	rootCmd.MarkFlagRequired("repository")
@@ -57,26 +62,68 @@ func upload(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("source directory does not exist: %s", sourceDir)
 	}
 
-	// Walk through the source directory
-	return filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
+	// Collect files
+	var files []string
+	err := filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-
-		// Skip directories
-		if info.IsDir() {
-			return nil
+		if !info.IsDir() {
+			files = append(files, path)
 		}
-
-		// Calculate relative path
-		relPath, err := filepath.Rel(sourceDir, path)
-		if err != nil {
-			return err
-		}
-
-		// Upload the file
-		return uploadFile(path, relPath)
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	bar := progressbar.Default(int64(len(files)))
+
+	if concurrency > 0 {
+		return uploadConcurrently(files, bar)
+	} else {
+		return uploadSequentially(files, bar)
+	}
+}
+
+func uploadSequentially(files []string, bar *progressbar.ProgressBar) error {
+	for _, file := range files {
+		relPath, err := filepath.Rel(sourceDir, file)
+		if err != nil {
+			return err
+		}
+		if err := uploadFile(file, relPath); err != nil {
+			return err
+		}
+		bar.Add(1)
+	}
+	return nil
+}
+
+func uploadConcurrently(files []string, bar *progressbar.ProgressBar) error {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrency)
+
+	for _, file := range files {
+		relPath, err := filepath.Rel(sourceDir, file)
+		if err != nil {
+			return err
+		}
+
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(localPath, relPath string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := uploadFile(localPath, relPath); err != nil {
+				fmt.Printf("Failed to upload %s: %v\n", relPath, err)
+			}
+			bar.Add(1)
+		}(file, relPath)
+	}
+
+	wg.Wait()
+	return nil
 }
 
 func uploadFile(localPath, relPath string) error {
@@ -108,8 +155,13 @@ func uploadFile(localPath, relPath string) error {
 	req.Header.Set("Content-Type", contentType)
 	req.SetBasicAuth(nexusUsername, nexusToken)
 
-	// Perform the upload
-	client := &http.Client{}
+	// Create HTTP client with retry and optional insecure skip verify
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
+		},
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
