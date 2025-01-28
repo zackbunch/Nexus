@@ -17,6 +17,22 @@ type Client struct {
 	RepositoryService *RepositoryService
 }
 
+// RepositoryService handles operations related to Nexus repositories
+type RepositoryService struct {
+	client *Client
+}
+
+// RepositoryServiceResponse represents the response from the Nexus API
+type RepositoryServiceResponse struct {
+	Items             []Asset `json:"items"`
+	ContinuationToken string  `json:"continuationToken"`
+}
+
+// Asset represents a single asset in the Nexus repository
+type Asset struct {
+	DownloadURL string `json:"downloadUrl"`
+}
+
 // NewClient initializes and returns a new Client instance.
 func NewClient(baseURL, username, password string) (*Client, error) {
 	// Basic validation for required fields
